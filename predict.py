@@ -1,60 +1,40 @@
-from pathlib import Path
-import pandas as pd
 import joblib
+import pandas as pd
+
+from config import MODEL_PATH, SUBMISSION_PATH, TEST_PATH
 
 
-# 1. Пути к файлам
-BASE_DIR = Path(__file__).resolve().parent
+def create_submission(model_data=None):
+    """Создаёт Kaggle submission с помощью обученной модели."""
+    test = pd.read_csv(TEST_PATH)
 
-TEST_PATH = BASE_DIR / "data" / "test.csv"
-MODEL_PATH = BASE_DIR / "models" / "xgboost_400.joblib"
+    if model_data is None:
+        model_data = joblib.load(MODEL_PATH)
 
-SUBMISSION_PATH = (
-    BASE_DIR / "submissions" / "submission_xgboost.csv"
-)
+    pipeline = model_data["pipeline"]
+    features = model_data["features"]
+    model_name = model_data["model_name"]
 
+    predictions = pipeline.predict(test[features])
 
-# 2. Загружаем тестовые данные
-test = pd.read_csv(TEST_PATH)
+    submission = pd.DataFrame({
+        "PassengerId": test["PassengerId"],
+        "Survived": predictions.astype(int)
+    })
 
+    assert submission.shape == (len(test), 2)
+    assert submission["Survived"].isin([0, 1]).all()
 
-# 3. Загружаем сохранённую модель
-model_data = joblib.load(MODEL_PATH)
+    SUBMISSION_PATH.parent.mkdir(parents=True, exist_ok=True)
+    submission.to_csv(SUBMISSION_PATH, index=False)
 
-pipeline = model_data["pipeline"]
-features = model_data["features"]
+    print(f"\n{model_name.upper()} SUBMISSION")
+    print(submission.head())
+    print(f"Количество предсказаний: {len(submission)}")
+    print(f"Файл сохранён: {SUBMISSION_PATH}")
 
-
-# 4. Подготавливаем признаки
-X_test = test[features]
-
-
-# 5. Получаем предсказания
-predictions = pipeline.predict(X_test)
-
-
-# 6. Формируем submission
-submission = pd.DataFrame({
-    "PassengerId": test["PassengerId"],
-    "Survived": predictions.astype(int)
-})
+    return submission
 
 
-# 7. Проверяем результат
-assert submission.shape == (418, 2)
-assert submission["Survived"].isin([0, 1]).all()
-
-
-# 8. Сохраняем файл
-SUBMISSION_PATH.parent.mkdir(parents=True, exist_ok=True)
-
-submission.to_csv(
-    SUBMISSION_PATH,
-    index=False
-)
-
-
-print("XGBOOST SUBMISSION")
-print(submission.head())
-print(f"\nКоличество предсказаний: {len(submission)}")
-print(f"Файл сохранён: {SUBMISSION_PATH}")
+if __name__ == "__main__":
+    create_submission()

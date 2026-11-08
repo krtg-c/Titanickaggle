@@ -1,181 +1,179 @@
-
 from pathlib import Path
+import sys
 
 import numpy as np
 import pandas as pd
 import torch
+from sklearn.base import BaseEstimator, ClassifierMixin
+from sklearn.compose import ColumnTransformer
+from sklearn.impute import SimpleImputer
+from sklearn.model_selection import StratifiedKFold, cross_val_score
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
-from sklearn.compose import ColumnTransformer
-from sklearn.impute import SimpleImputer
-from sklearn.metrics import accuracy_score
-from sklearn.model_selection import StratifiedKFold
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
-
-
-
-# 1. Загружаем данные
-
+# Добавляем корневую папку проекта для импорта config.py
 BASE_DIR = Path(__file__).resolve().parents[1]
-train = pd.read_csv(BASE_DIR / "data" / "train.csv")
+sys.path.append(str(BASE_DIR))
 
-features = [
-    "Pclass", "Sex", "Age", "SibSp",
-    "Parch", "Fare", "Embarked"
-]
-
-numeric_features = [
-    "Pclass", "Age", "SibSp", "Parch", "Fare"
-]
-
-categorical_features = ["Sex", "Embarked"]
-
-X = train[features]
-y = train["Survived"].to_numpy()
-
-
-# 2. Настройки эксперимента
-
-EPOCHS = 80
-BATCH_SIZE = 32
-LEARNING_RATE = 0.001
-
-cv = StratifiedKFold(
-    n_splits=10,
-    shuffle=True,
-    random_state=42
+from config import (  # noqa: E402
+    CATEGORICAL_FEATURES,
+    CV_FOLDS,
+    FEATURES,
+    MODEL_PARAMS,
+    NUMERIC_FEATURES,
+    RANDOM_STATE,
+    TARGET,
+    TRAIN_PATH
 )
 
-scores = []
 
+class TorchMLPClassifier(ClassifierMixin, BaseEstimator):
+    """Небольшая нейросеть с интерфейсом sklearn."""
 
-# 3. Кросс-валидация
+    def __init__(
+        self,
+        epochs=80,
+        batch_size=32,
+        learning_rate=0.001,
+        weight_decay=0.0001,
+        random_state=42
+    ):
+        self.epochs = epochs
+        self.batch_size = batch_size
+        self.learning_rate = learning_rate
+        self.weight_decay = weight_decay
+        self.random_state = random_state
 
-for fold, (train_idx, valid_idx) in enumerate(
-    cv.split(X, y), start=1
-):
+    def fit(self, X, y):
+        """Создаёт и обучает нейросеть."""
+        X = np.asarray(X, dtype=np.float32)
+        y = np.asarray(y, dtype=np.float32).reshape(-1, 1)
 
-    # Данные текущего фолда
-    X_train = X.iloc[train_idx]
-    X_valid = X.iloc[valid_idx]
+        torch.manual_seed(self.random_state)
 
-    y_train = y[train_idx]
-    y_valid = y[valid_idx]
+        X_tensor = torch.tensor(X)
+        y_tensor = torch.tensor(y)
 
-    # Предобработка признаков
-    preprocessor = ColumnTransformer([
-        ("num", Pipeline([
-            ("imputer", SimpleImputer(strategy="median")),
-            ("scaler", StandardScaler())
-        ]), numeric_features),
+        dataset = TensorDataset(X_tensor, y_tensor)
+        generator = torch.Generator().manual_seed(self.random_state)
 
-        ("cat", Pipeline([
-            ("imputer", SimpleImputer(strategy="most_frequent")),
-            ("encoder", OneHotEncoder(
-                handle_unknown="ignore",
-                sparse_output=False
-            ))
-        ]), categorical_features)
-    ])
+        loader = DataLoader(
+            dataset,
+            batch_size=self.batch_size,
+            shuffle=True,
+            generator=generator
+        )
 
-    # Учим предобработку только на train
-    X_train_processed = preprocessor.fit_transform(
-        X_train
-    ).astype(np.float32)
+        input_size = X.shape[1]
 
-    X_valid_processed = preprocessor.transform(
-        X_valid
-    ).astype(np.float32)
+        self.model_ = nn.Sequential(
+            nn.Linear(input_size, 32),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(32, 16),
+            nn.ReLU(),
+            nn.Linear(16, 1)
+        )
 
-    # Преобразуем данные в тензоры
-    X_train_tensor = torch.tensor(X_train_processed)
-    y_train_tensor = torch.tensor(
-        y_train, dtype=torch.float32
-    ).reshape(-1, 1)
+        criterion = nn.BCEWithLogitsLoss()
+        optimizer = torch.optim.Adam(
+            self.model_.parameters(),
+            lr=self.learning_rate,
+            weight_decay=self.weight_decay
+        )
 
-    X_valid_tensor = torch.tensor(X_valid_processed)
+        for _ in range(self.epochs):
+            self.model_.train()
 
-    # Формируем батчи
-    dataset = TensorDataset(
-        X_train_tensor, y_train_tensor
-    )
+            for X_batch, y_batch in loader:
+                optimizer.zero_grad()
+                outputs = self.model_(X_batch)
+                loss = criterion(outputs, y_batch)
+                loss.backward()
+                optimizer.step()
 
-    generator = torch.Generator().manual_seed(42 + fold)
+        self.classes_ = np.array([0, 1])
+        self.n_features_in_ = X.shape[1]
+        return self
 
-    loader = DataLoader(
-        dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=True,
-        generator=generator
-    )
+    def predict(self, X):
+        """Возвращает класс 0 или 1."""
+        X = np.asarray(X, dtype=np.float32)
+        X_tensor = torch.tensor(X)
 
-    # Создаём новую сеть для каждого фолда
-    torch.manual_seed(42 + fold)
+        self.model_.eval()
 
-    input_size = X_train_processed.shape[1]
+        with torch.no_grad():
+            logits = self.model_(X_tensor)
+            probabilities = torch.sigmoid(logits)
 
-    model = nn.Sequential(
-        nn.Linear(input_size, 32),
-        nn.ReLU(),
-        nn.Dropout(0.2),
-
-        nn.Linear(32, 16),
-        nn.ReLU(),
-
-        nn.Linear(16, 1)
-    )
-
-    # Функция потерь и оптимизатор
-    criterion = nn.BCEWithLogitsLoss()
-
-    optimizer = torch.optim.Adam(
-        model.parameters(),
-        lr=LEARNING_RATE,
-        weight_decay=0.0001
-    )
-
-    # 4. Обучаем нейросеть
-    for epoch in range(EPOCHS):
-        model.train()
-
-        for X_batch, y_batch in loader:
-
-            optimizer.zero_grad()
-
-            outputs = model(X_batch)
-
-            loss = criterion(outputs, y_batch)
-
-            loss.backward()
-
-            optimizer.step()
-
-    # 5. Проверяем точность
-    model.eval()
-
-    with torch.no_grad():
-        logits = model(X_valid_tensor)
-        probabilities = torch.sigmoid(logits)
-
-        predictions = (
+        return (
             probabilities.numpy().ravel() >= 0.5
         ).astype(int)
 
-    score = accuracy_score(y_valid, predictions)
-    scores.append(score)
 
-    print(f"Fold {fold}: {score * 100:.2f}%")
+def main():
+    """Запускает отдельный CV-эксперимент с MLP."""
+    train = pd.read_csv(TRAIN_PATH)
+    X = train[FEATURES]
+    y = train[TARGET]
+
+    numeric_transformer = Pipeline([
+        ("imputer", SimpleImputer(strategy="median")),
+        ("scaler", StandardScaler())
+    ])
+
+    categorical_transformer = Pipeline([
+        ("imputer", SimpleImputer(strategy="most_frequent")),
+        (
+            "encoder",
+            OneHotEncoder(
+                handle_unknown="ignore",
+                sparse_output=False
+            )
+        )
+    ])
+
+    preprocessor = ColumnTransformer([
+        ("num", numeric_transformer, NUMERIC_FEATURES),
+        ("cat", categorical_transformer, CATEGORICAL_FEATURES)
+    ])
+
+    pipeline = Pipeline([
+        ("preprocessor", preprocessor),
+        (
+            "classifier",
+            TorchMLPClassifier(**MODEL_PARAMS["mlp"])
+        )
+    ])
+
+    cv = StratifiedKFold(
+        n_splits=CV_FOLDS,
+        shuffle=True,
+        random_state=RANDOM_STATE
+    )
+
+    cv_scores = cross_val_score(
+        pipeline,
+        X,
+        y,
+        cv=cv,
+        scoring="accuracy"
+    )
+
+    print("MLP RESULTS")
+
+    for fold, score in enumerate(cv_scores, start=1):
+        print(f"Fold {fold}: {score * 100:.2f}%")
+
+    print(f"\nMean CV: {cv_scores.mean() * 100:.2f}%")
+    print(f"Std CV: {cv_scores.std() * 100:.2f} п.п.")
+    print(f"Min CV: {cv_scores.min() * 100:.2f}%")
+    print(f"Max CV: {cv_scores.max() * 100:.2f}%")
 
 
-# 6. Итоги эксперимента
-
-scores = np.array(scores)
-
-print("MLP RESULTS")
-print(f"Mean CV: {scores.mean() * 100:.2f}%")
-print(f"Std CV: {scores.std() * 100:.2f} п.п.")
-print(f"Min CV: {scores.min() * 100:.2f}%")
-print(f"Max CV: {scores.max() * 100:.2f}%")
+if __name__ == "__main__":
+    main()

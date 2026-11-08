@@ -7,3 +7,4 @@ joblib
 catboost
 torch
 xgboost
+jupyter
